@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+config_file="$HOME/.config/cpanel-tools/servers"
+
+if [ ! -f "$config_file" ]; then
+  echo -e "${RED}Error: Config file not found${NC}"
+  exit 1
+fi
+
+echo -e "${BLUE}Verifying server configurations...${NC}"
+echo
+
+# Check file permissions
+file_perms=$(stat -c "%a" "$config_file")
+if [ "$file_perms" != "600" ]; then
+  echo -e "${RED}Warning: Config file permissions should be 600, current: $file_perms${NC}"
+  chmod 600 "$config_file"
+  echo -e "${GREEN}Fixed file permissions${NC}"
+fi
+
+dir_perms=$(stat -c "%a" "$(dirname "$config_file")")
+if [ "$dir_perms" != "700" ]; then
+  echo -e "${RED}Warning: Config directory permissions should be 700, current: $dir_perms${NC}"
+  chmod 700 "$(dirname "$config_file")"
+  echo -e "${GREEN}Fixed directory permissions${NC}"
+fi
+
+# Check for duplicate server names
+echo -e "${YELLOW}Checking for duplicate server names...${NC}"
+dupes=$(cut -d: -f1 "$config_file" | sort | uniq -d)
+if [ -n "$dupes" ]; then
+  echo -e "${RED}Found duplicate server names:${NC}"
+  echo "$dupes"
+else
+  echo -e "${GREEN}No duplicate server names found${NC}"
+fi
+
+# Check for duplicate IPs
+echo -e "\n${YELLOW}Checking for duplicate IPs...${NC}"
+dupes=$(cut -d: -f2 "$config_file" | tr -d '[:space:]' | sort | uniq -d)
+if [ -n "$dupes" ]; then
+  echo -e "${RED}Found duplicate IPs:${NC}"
+  echo "$dupes"
+else
+  echo -e "${GREEN}No duplicate IPs found${NC}"
+fi
+
+# Verify file format and values
+echo -e "\n${YELLOW}Verifying entry formats...${NC}"
+line_num=1
+while IFS=: read -r name ip type token || [[ -n "$name" ]]; do
+  errors=()
+
+  # Trim whitespace
+  ip=$(echo "$ip" | tr -d '[:space:]')
+  name=$(echo "$name" | tr -d '[:space:]')
+  type=$(echo "$type" | tr -d '[:space:]')
+
+  # Check IP format
+  if ! echo "$ip" | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' >/dev/null; then
+    errors+=("Invalid IP format: $ip")
+  fi
+
+  # Check type
+  if [[ "$type" != "whm" && "$type" != "cpanel" ]]; then
+    errors+=("Invalid type: $type")
+  fi
+
+  # Check token (basic format check)
+  if [ -z "$token" ]; then
+    errors+=("Empty token")
+  fi
+
+  if [ ${#errors[@]} -ne 0 ]; then
+    echo -e "${RED}Line $line_num has errors:${NC}"
+    for error in "${errors[@]}"; do
+      echo "  - $error"
+    done
+  fi
+
+  ((line_num++))
+done <"$config_file"
+
+# Check service accessibility
+echo -e "\n${YELLOW}Checking service accessibility...${NC}"
+while IFS=: read -r name ip type token || [[ -n "$name" ]]; do
+  ip=$(echo "$ip" | tr -d '[:space:]')
+  name=$(echo "$name" | tr -d '[:space:]')
+  type=$(echo "$type" | tr -d '[:space:]')
+
+  port="2087"
+  if [ "$type" = "cpanel" ]; then
+    port="2083"
+  fi
+
+  printf "%-20s %-15s %-8s " "$name" "$ip" "$type"
+  if nc -z -w2 "$ip" "$port" >/dev/null 2>&1; then
+    echo -e "${GREEN}✓ Accessible${NC}"
+  else
+    echo -e "${RED}✗ Not accessible${NC}"
+  fi
+done <"$config_file"
+
+echo -e "\n${YELLOW}Checking domain cache...${NC}"
+cache_file="$HOME/.config/cpanel-tools/domain_cache"
+
+if [ -f "$cache_file" ]; then
+  # Check file permissions
+  file_perms=$(stat -c "%a" "$cache_file")
+  if [ "$file_perms" != "600" ]; then
+    echo -e "${RED}Warning: Cache file permissions should be 600, current: $file_perms${NC}"
+    chmod 600 "$cache_file"
+    echo -e "${GREEN}Fixed cache file permissions${NC}"
+  fi
+  
+  # Check for stale entries (older than 7 days)
+  current_time=$(date +%s)
+  stale_count=0
+  while IFS=: read -r domain name ip type timestamp || [[ -n "$domain" ]]; do
+    [ -z "$domain" ] && continue
+    
+    age=$((current_time - timestamp))
+    if [ $age -gt 604800 ]; then  # 7 days in seconds
+      ((stale_count++))
+    fi
+  done < "$cache_file"
+  
+  if [ $stale_count -gt 0 ]; then
+    echo -e "${YELLOW}Found $stale_count stale cache entries (older than 7 days)${NC}"
+    echo "You can clear the cache with: server-lookup --clear-cache"
+  else
+    echo -e "${GREEN}Cache looks good${NC}"
+  fi
+  
+  # Print cache stats
+  entry_count=$(grep -c ":" "$cache_file" 2>/dev/null || echo 0)
+  echo "Total cache entries: $entry_count"
+else
+  echo -e "${YELLOW}No domain cache found${NC}"
+fi

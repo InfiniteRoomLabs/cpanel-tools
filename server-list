@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+
+BLUE='\033[0;34m'
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+config_file="$HOME/.config/cpanel-tools/servers"
+
+if [ ! -f "$config_file" ]; then
+  echo -e "${RED}Error: Config file not found${NC}"
+  exit 1
+fi
+
+echo -e "${BLUE}Server List:${NC}"
+printf "${GREEN}%-20s %-15s %-8s %-15s %-10s %s${NC}\n" "Name" "IP Address" "Type" "Token" "WHM Port" "Status"
+echo "--------------------------------------------------------------------------------"
+
+while IFS=: read -r name ip type token || [[ -n "$name" ]]; do
+  # Clean up any whitespace
+  ip=$(echo "$ip" | tr -d '[:space:]')
+  name=$(echo "$name" | tr -d '[:space:]')
+  type=$(echo "$type" | tr -d '[:space:]')
+  token=$(echo "$token" | tr -d '[:space:]')
+
+  # Mask token
+  masked_token="${token:0:4}...${token: -4}"
+
+  # Check if WHM/cPanel port is responding
+  port="2087"
+  if [ "$type" = "cpanel" ]; then
+    port="2083"
+  fi
+
+  if nc -z -w2 "$ip" "$port" >/dev/null 2>&1; then
+    status="✓"
+  else
+    status="✗"
+  fi
+
+  printf "%-20s %-15s %-8s %-15s %-10s %s\n" \
+    "$name" "$ip" "$type" "$masked_token" "$port" "$status"
+done <"$config_file"

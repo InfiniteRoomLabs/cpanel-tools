@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+config_file="$HOME/.config/cpanel-tools/servers"
+cache_file="$HOME/.config/cpanel-tools/domain_cache"
+cache_dir="$(dirname "$cache_file")"
+
+# Default output format
+OUTPUT_FORMAT="text"
+USE_CACHE=true
+CACHE_MAX_AGE=86400  # 24 hours in seconds
+
+usage() {
+  cat <<EOF
+Usage: $0 domain.com [options]
+
+Options:
+    -f, --format FORMAT   Output format (text|json) [default: text]
+    --no-cache           Bypass the cache and force a fresh lookup
+    --clear-cache        Clear the entire domain cache
+    --refresh-cache      Force refresh of this domain in the cache
+    --help               Show this help message
+EOF
+}
+
+# Create cache directory if it doesn't exist
+if [ ! -d "$cache_dir" ]; then
+  mkdir -p "$cache_dir"
+  chmod 700 "$cache_dir"
+fi
+
+# Create cache file if it doesn't exist
+if [ ! -f "$cache_file" ]; then
+  touch "$cache_file"
+  chmod 600 "$cache_file"
+fi
+
+# Check if domain was provided
+if [ $# -eq 0 ]; then
+  usage
+  exit 1
+fi
+
+# Parse arguments
+DOMAIN=""
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  -f | --format)
+    OUTPUT_FORMAT="$2"
+    shift 2
+    ;;
+  --no-cache)
+    USE_CACHE=false
+    shift
+    ;;
+  --clear-cache)
+    echo -e "${YELLOW}Clearing domain cache...${NC}"
+    > "$cache_file"
+    echo -e "${GREEN}Cache cleared${NC}"
+    exit 0
+    ;;
+  --refresh-cache)
+    USE_CACHE=false
+    shift
+    ;;
+  --help)
+    usage
+    exit 0
+    ;;
+  *)
+    if [ -z "$DOMAIN" ]; then
+      DOMAIN="$1"
+    else
+      echo -e "${RED}Error: Unexpected argument '$1'${NC}"
+      usage
+      exit 1
+    fi
+    shift
+    ;;
+  esac
+done
+
+# Check if config file exists
+if [ ! -f "$config_file" ]; then
+  if [ "$OUTPUT_FORMAT" = "json" ]; then
+    echo '{"error": "Server config file not found", "success": false}'
+  else
+    echo -e "${RED}Error: Server config file not found at $config_file${NC}"
+  fi
+  exit 1
+fi
+
+# Check cache for domain
+domain_from_cache=false
+if [ "$USE_CACHE" = true ]; then
+  current_time=$(date +%s)
+  
+  while IFS=: read -r cached_domain cached_name cached_ip cached_type cached_timestamp || [[ -n "$cached_domain" ]]; do
+    # Skip empty lines
+    [ -z "$cached_domain" ] && continue
+    
+    if [ "$cached_domain" = "$DOMAIN" ]; then
+      # Check if cache entry is still valid
+      age=$((current_time - cached_timestamp))
+      if [ $age -lt $CACHE_MAX_AGE ]; then
+        domain_from_cache=true
+        domain_ip="$cached_ip"
+        
+        if [ "$OUTPUT_FORMAT" = "json" ]; then
+          echo "{\"success\": true, \"server\": {\"name\": \"$cached_name\", \"ip\": \"$cached_ip\", \"type\": \"$cached_type\"}, \"cached\": true, \"cache_age\": $age}"
+        else
+          echo -e "${GREEN}Found matching server (cached): $cached_name${NC}"
+          echo "Server Type: $cached_type"
+          echo "Server IP: $cached_ip"
+          echo "Cache Age: $age seconds"
+          
+          # Get account username for cached results if it's a WHM/cPanel server
+          if [ "$cached_type" = "whm" ] || [ "$cached_type" = "cpanel" ]; then
+            account_info=$(server-account-query -s "$cached_name" -t domain -v "$DOMAIN" -w "user" -f csv 2>/dev/null | tail -n1)
+            if [ -n "$account_info" ]; then
+              echo "Account Name: $account_info"
+            fi
+          fi
+          
+          if [ "$cached_type" = "whm" ]; then
+            echo "WHM URL: https://$cached_ip:2087"
+          elif [ "$cached_type" = "cpanel" ]; then
+            echo "cPanel URL: https://$cached_ip:2083"
+          fi
+        fi
+        break
+      fi
+    fi
+  done < "$cache_file"
+fi
+
+# If not found in cache or cache bypass is requested, do the lookup
+if [ "$domain_from_cache" = false ]; then
+  # Resolve domain IP using dig
+  domain_ip=$(dig +short A "$DOMAIN" | head -n1)
+
+  if [ -z "$domain_ip" ]; then
+    if [ "$OUTPUT_FORMAT" = "json" ]; then
+      echo '{"error": "Could not resolve IP address for domain", "success": false}'
+    else
+      echo -e "${RED}Error: Could not resolve IP address for $DOMAIN${NC}"
+    fi
+    exit 1
+  fi
+
+  # Search through the config file for matching IP
+  found=false
+  while IFS=: read -r name ip type token || [[ -n "$name" ]]; do
+    # Clean up any whitespace
+    ip=$(echo "$ip" | tr -d '[:space:]')
+    name=$(echo "$name" | tr -d '[:space:]')
+    type=$(echo "$type" | tr -d '[:space:]')
+
+    if [ "$ip" = "$domain_ip" ]; then
+      found=true
+      
+      # Update cache
+      current_time=$(date +%s)
+      # Remove any existing entry for this domain
+      sed -i "/^$DOMAIN:/d" "$cache_file" 2>/dev/null
+      # Add new entry
+      echo "$DOMAIN:$name:$ip:$type:$current_time" >> "$cache_file"
+      
+      # Get account username if it's a WHM/cPanel server
+      account_username=""
+      if [ "$type" = "whm" ] || [ "$type" = "cpanel" ]; then
+        # Query for account details
+        account_info=$(server-account-query -s "$name" -t domain -v "$DOMAIN" -w "user" -f csv 2>/dev/null | tail -n1)
+        if [ -n "$account_info" ]; then
+          account_username="$account_info"
+        fi
+      fi
+      
+      if [ "$OUTPUT_FORMAT" = "json" ]; then
+        if [ -n "$account_username" ]; then
+          echo "{\"success\": true, \"server\": {\"name\": \"$name\", \"ip\": \"$ip\", \"type\": \"$type\", \"account\": \"$account_username\"}, \"cached\": false}"
+        else
+          echo "{\"success\": true, \"server\": {\"name\": \"$name\", \"ip\": \"$ip\", \"type\": \"$type\"}, \"cached\": false}"
+        fi
+      else
+        echo -e "${GREEN}Found matching server: $name${NC}"
+        echo "Server Type: $type"
+        echo "Server IP: $ip"
+        if [ -n "$account_username" ]; then
+          echo "Account Name: $account_username"
+        fi
+        if [ "$type" = "whm" ]; then
+          echo "WHM URL: https://$ip:2087"
+        elif [ "$type" = "cpanel" ]; then
+          echo "cPanel URL: https://$ip:2083"
+        fi
+      fi
+      break
+    fi
+  done <"$config_file"
+fi
+
+if [ "$found" = false ]; then
+  if [ "$OUTPUT_FORMAT" = "json" ]; then
+    echo "{\"error\": \"No matching server found for IP $domain_ip\", \"success\": false}"
+  else
+    echo -e "${RED}No matching server found for IP $domain_ip${NC}"
+  fi
+  exit 1
+fi

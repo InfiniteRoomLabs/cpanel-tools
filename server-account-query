@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# Default values
+SERVER_NAME=""
+SEARCH_TYPE=""
+SEARCH_VALUE=""
+WANT_FIELDS="domain,user,ip,owner,plan,diskused,disklimit,suspended"
+OUTPUT_FORMAT="table"
+CONFIG_FILE="$HOME/.config/cpanel-tools/servers"
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [options]
+
+Options:
+    -s, --server SERVER   Server name from config (required)
+    -t, --type TYPE      Search type (domain|owner|user|ip|package)
+    -v, --value VALUE    Value to match exactly
+    -w, --want FIELDS    Comma-separated list of fields to display
+                        [default: domain,user,ip,owner,plan,diskused,disklimit,suspended]
+    -f, --format FORMAT  Output format (table|csv|json) [default: table]
+    --debug              Enable debug mode
+    --help              Show this help message
+
+Available fields:
+    domain, user, ip, owner, plan, diskused, disklimit, email, suspended,
+    shell, partition, maxftp, maxsql, maxpop, maxlst, maxsub, maxpark,
+    maxaddon, suspendtime, suspendreason, uid, outgoing_mail_suspended
+
+Example:
+    $(basename "$0") -s myserver -t domain -v domain.com -w 'domain,user,ip,diskused'
+EOF
+}
+
+check_dependencies() {
+  for cmd in curl jq column tr; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      echo -e "${RED}Error: Required command '$cmd' not found.${NC}"
+      echo "Please install missing dependencies."
+      exit 1
+    fi
+  done
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  -s | --server)
+    SERVER_NAME="$2"
+    shift 2
+    ;;
+  -t | --type)
+    SEARCH_TYPE="$2"
+    shift 2
+    ;;
+  -v | --value)
+    SEARCH_VALUE="$2"
+    shift 2
+    ;;
+  -w | --want)
+    WANT_FIELDS="$2"
+    shift 2
+    ;;
+  -f | --format)
+    OUTPUT_FORMAT="$2"
+    shift 2
+    ;;
+  --debug)
+    set -x
+    shift
+    ;;
+  --help)
+    usage
+    exit 0
+    ;;
+  *)
+    echo -e "${RED}Error: Unknown option $1${NC}"
+    usage
+    exit 1
+    ;;
+  esac
+done
+
+# Validate required parameters
+if [[ -z "$SERVER_NAME" ]]; then
+  echo -e "${RED}Error: Server name is required${NC}"
+  usage
+  exit 1
+fi
+
+# Check if config file exists
+if [ ! -f "$CONFIG_FILE" ]; then
+  echo -e "${RED}Error: Server config file not found at $CONFIG_FILE${NC}"
+  exit 1
+fi
+
+# Get server details from config
+if ! server_line=$(grep "^${SERVER_NAME}:" "$CONFIG_FILE"); then
+  echo -e "${RED}Error: Server '$SERVER_NAME' not found in config${NC}"
+  exit 1
+fi
+
+# Parse server details
+IFS=: read -r name ip type token <<<"$server_line"
+
+# Validate server type
+if [[ "$type" != "whm" ]]; then
+  echo -e "${RED}Error: Server '$SERVER_NAME' is not a WHM server${NC}"
+  exit 1
+fi
+
+# Build API URL to get all accounts
+URL="https://$ip:2087/json-api/listaccts?api.version=1"
+if [[ -n "$WANT_FIELDS" ]]; then
+  URL+="&want=$WANT_FIELDS"
+fi
+
+# Make API request
+response=$(curl --insecure -s -H "Authorization: $type root:$token" "$URL")
+
+# Check if request was successful
+if ! echo "$response" | jq -e '.metadata.result == 1' >/dev/null; then
+  error=$(echo "$response" | jq -r '.metadata.reason // "Unknown error"')
+  echo -e "${RED}Error: API request failed - $error${NC}"
+  exit 1
+fi
+
+# Filter results if search type and value are provided
+if [[ -n "$SEARCH_TYPE" && -n "$SEARCH_VALUE" ]]; then
+  response=$(echo "$response" | jq --arg type "$SEARCH_TYPE" --arg value "$SEARCH_VALUE" '
+    . + {
+      "data": {
+        "acct": [
+          .data.acct[] | select(.[$type] == $value)
+        ]
+      }
+    }
+  ')
+fi
+
+# Process response based on output format
+case "$OUTPUT_FORMAT" in
+table)
+  temp_file=$(mktemp)
+
+  # Check if we can do disk usage calculation
+  ADD_DISK_USAGE=$([[ "$WANT_FIELDS" =~ "diskused" && "$WANT_FIELDS" =~ "disklimit" ]] && echo true || echo false)
+
+  # Create column names based on available fields
+  COLUMN_NAMES="$WANT_FIELDS"
+  [[ "$ADD_DISK_USAGE" == true ]] && COLUMN_NAMES+=",DISK_USED"
+  COLUMN_NAMES=$(echo "$COLUMN_NAMES" | tr '[:lower:]' '[:upper:]')
+
+  # Text-align fields (domain and user)
+  TEXT_FIELDS=$(echo "$WANT_FIELDS" | tr ',' '\n' | grep -E '^(domain|user)$' | tr '[:lower:]' '[:upper:]' | paste -sd ',')
+
+  echo "$response" | jq -r --arg fields "$WANT_FIELDS" --argjson add_disk_usage "$ADD_DISK_USAGE" '
+    .data.acct[] as $account |
+    ($fields | split(",")) as $fields |
+    ($fields | map($account[.] | if . == 1 then "YES" elif . == 0 then "NO" else tostring end) | join("\t")) as $base |
+    if $add_disk_usage then
+      ($account.diskused | rtrimstr("M") | tonumber) as $used |
+      ($account.disklimit | if . == "unlimited" then "∞" else rtrimstr("M") | tonumber end) as $limit |
+      ($limit | if . == "∞" then "-" else (($used / .) * 100 | floor | tostring + "%") end) as $percent |
+      $base + "\t" + $percent
+    else
+      $base
+    end
+  ' >>"$temp_file"
+
+  column -t -s $'\t' -N "$COLUMN_NAMES" -T "$TEXT_FIELDS" "$temp_file"
+
+  rm "$temp_file"
+  ;;
+csv)
+  # Header
+  echo "$WANT_FIELDS"
+  # Data
+  echo "$response" | jq -r --arg fields "$WANT_FIELDS" '
+    .data.acct[] as $account |
+    ($fields | split(",")) |
+    map($account[.] | if . == 1 then "YES" elif . == 0 then "NO" else tostring end) |
+    join(",")
+  '
+  ;;
+json)
+  echo "$response" | jq '.'
+  ;;
+*)
+  echo -e "${RED}Error: Invalid output format${NC}"
+  exit 1
+  ;;
+esac
